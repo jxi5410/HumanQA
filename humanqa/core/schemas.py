@@ -64,6 +64,8 @@ class Credentials(BaseModel):
 class RunConfig(BaseModel):
     """Everything needed to invoke a run."""
     target_url: str
+    repo_url: str | None = None
+    github_token_env: str = "GITHUB_TOKEN"
     mobile_target: str | None = None
     credentials: Credentials | None = None
     brief: str | None = None
@@ -75,6 +77,31 @@ class RunConfig(BaseModel):
     llm_provider: str = "anthropic"
     llm_model: str = "claude-sonnet-4-20250514"
     output_dir: str = "./artifacts"
+
+
+# ---------------------------------------------------------------------------
+# Repo Insights
+# ---------------------------------------------------------------------------
+
+class RepoInsights(BaseModel):
+    """Structured understanding extracted from a GitHub repository."""
+    product_name: str = ""
+    description: str = ""
+    tech_stack: list[str] = Field(default_factory=list)
+    claimed_features: list[str] = Field(default_factory=list)
+    routes_or_pages: list[str] = Field(default_factory=list)
+    recent_changes: list[str] = Field(default_factory=list)
+    known_issues: list[str] = Field(default_factory=list)
+    configuration_hints: list[str] = Field(default_factory=list)
+    documentation_summary: str = ""
+    repo_confidence: float = 0.0
+
+
+class FeatureExpectation(BaseModel):
+    """A feature the product claims to have, with verification status."""
+    feature_name: str
+    source: str = ""  # e.g. "README", "CHANGELOG", "docs/", "GitHub issue"
+    verified: bool | None = None  # None = not yet checked, True/False = checked
 
 
 # ---------------------------------------------------------------------------
@@ -95,6 +122,8 @@ class ProductIntentModel(BaseModel):
     assumptions: list[str] = Field(default_factory=list)
     confidence: float = 0.0
     raw_signals: dict[str, Any] = Field(default_factory=dict)
+    repo_insights: RepoInsights | None = None
+    feature_expectations: list[FeatureExpectation] = Field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
