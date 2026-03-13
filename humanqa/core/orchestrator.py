@@ -11,10 +11,16 @@ import logging
 from datetime import datetime
 
 from humanqa.core.llm import LLMClient
+from humanqa.core.performance import (
+    evaluate_snapshot_performance,
+    performance_results_to_issues,
+    summarize_performance,
+)
 from humanqa.core.schemas import (
     AgentPersona,
     CoverageMap,
     Issue,
+    PageSnapshot,
     Platform,
     ProductIntentModel,
     RunConfig,
@@ -52,6 +58,7 @@ class Orchestrator:
         self.output_dir = output_dir
         self.web_runner = WebRunner(llm, output_dir)
         self.mobile_runner = MobileRunner(llm, output_dir)
+        self._collected_snapshots: list[PageSnapshot] = []
 
     async def run(
         self,
@@ -113,10 +120,16 @@ class Orchestrator:
             )
             all_issues.extend(mobile_issues)
 
-        # Step 4: Deduplicate
+        # Step 4: Evaluate performance budgets from collected snapshots
+        perf_issues, perf_scores = self._evaluate_performance(
+            self._collected_snapshots, intent.product_type,
+        )
+        all_issues.extend(perf_issues)
+
+        # Step 5: Deduplicate
         deduped = self._deduplicate_issues(all_issues)
 
-        # Step 5: Rank by severity and confidence
+        # Step 6: Rank by severity and confidence
         ranked = sorted(
             deduped,
             key=lambda i: (
@@ -127,6 +140,7 @@ class Orchestrator:
 
         result.issues = ranked
         result.coverage = coverage
+        result.scores.update(perf_scores)
         result.completed_at = datetime.now(tz=__import__("datetime").timezone.utc)
 
         return result
@@ -172,6 +186,37 @@ class Orchestrator:
                     intent.critical_journeys[(start + 1) % len(intent.critical_journeys)],
                 ]
             return result
+
+    def add_snapshots(self, snapshots: list[PageSnapshot]) -> None:
+        """Register snapshots collected during evaluation for performance analysis."""
+        self._collected_snapshots.extend(snapshots)
+
+    def _evaluate_performance(
+        self,
+        snapshots: list[PageSnapshot],
+        product_type: str,
+    ) -> tuple[list[Issue], dict]:
+        """Evaluate performance metrics from collected snapshots against budgets."""
+        if not snapshots:
+            return [], {}
+
+        all_perf_results = []
+        all_perf_issues: list[Issue] = []
+        seen_urls: set[str] = set()
+
+        for snapshot in snapshots:
+            # Evaluate each unique URL only once (use first snapshot per URL)
+            if snapshot.url in seen_urls:
+                continue
+            seen_urls.add(snapshot.url)
+
+            results = evaluate_snapshot_performance(snapshot, product_type)
+            all_perf_results.extend(results)
+            issues = performance_results_to_issues(results, snapshot)
+            all_perf_issues.extend(issues)
+
+        scores = summarize_performance(all_perf_results) if all_perf_results else {}
+        return all_perf_issues, scores
 
     def _deduplicate_issues(self, issues: list[Issue]) -> list[Issue]:
         """Remove near-duplicate issues found by multiple agents.
