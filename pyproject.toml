@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "humanqa"
+version = "0.1.0"
+description = "External-experience AI QA system — evaluates products like real users would"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "anthropic>=0.40.0",
+    "openai>=1.50.0",
+    "playwright>=1.48.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.32.0",
+    "pydantic>=2.9.0",
+    "pyyaml>=6.0",
+    "click>=8.1.0",
+    "rich>=13.9.0",
+    "httpx>=0.27.0",
+    "apscheduler>=3.10.0",
+    "jinja2>=3.1.0",
+    "pillow>=10.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24.0",
+    "ruff>=0.7.0",
+]
+
+[project.scripts]
+humanqa = "humanqa.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
