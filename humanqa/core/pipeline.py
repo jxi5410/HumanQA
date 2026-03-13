@@ -18,6 +18,7 @@ from humanqa.core.repo_analyzer import RepoAnalyzer
 from humanqa.core.schemas import RunConfig, RunResult
 from humanqa.lenses.design_lens import DesignLens
 from humanqa.lenses.institutional_lens import InstitutionalLens
+from humanqa.lenses.trust_lens import TrustLens
 from humanqa.reporting.report_generator import ReportGenerator
 from humanqa.runners.web_runner import WebRunner
 
@@ -81,6 +82,16 @@ async def run_pipeline(config: RunConfig) -> RunResult:
         design_issues = await design_lens.review(result, config.design_guidance)
         result.issues.extend(design_issues)
         logger.info("  Design review found %d issues", len(design_issues))
+
+    # Trust lens (always runs)
+    logger.info("  Running trust signal inventory...")
+    trust_lens = TrustLens(llm)
+    trust_issues, trust_scorecard = await trust_lens.review(result)
+    result.issues.extend(trust_issues)
+    logger.info(
+        "  Trust review: %.0f%% signals present, %d issues",
+        trust_scorecard.overall_score * 100, len(trust_issues),
+    )
 
     # Institutional lens
     inst_lens = InstitutionalLens(llm)
