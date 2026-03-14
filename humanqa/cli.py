@@ -50,11 +50,84 @@ def _check_exit_code(result, fail_on: str | None) -> int:
     return 0
 
 
-@click.group()
+@click.group(invoke_without_command=True)
 @click.version_option(version="0.2.0")
-def main():
-    """HumanQA — External-experience AI QA system."""
-    pass
+@click.pass_context
+def main(ctx):
+    """HumanQA — External-experience AI QA system.
+
+    Run with no arguments for interactive mode, or use a subcommand.
+    """
+    if ctx.invoked_subcommand is None:
+        _interactive_run()
+
+
+def _interactive_run():
+    """Interactive mode — asks the user for URL and repo."""
+    console.print("\n[bold]Welcome to HumanQA[/bold] — your team of AI QA companions\n")
+
+    url = console.input("[bold]What's the product URL?[/bold] (e.g. https://your-product.com): ").strip()
+    if not url:
+        console.print("[red]No URL provided. Exiting.[/red]")
+        sys.exit(1)
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    repo = console.input(
+        "[bold]GitHub repo URL?[/bold] (for deeper product understanding, or press Enter to skip): "
+    ).strip() or None
+
+    brief = console.input(
+        "[bold]Brief product description?[/bold] (or press Enter to let us figure it out): "
+    ).strip() or None
+
+    focus = console.input(
+        "[bold]Any specific flows to focus on?[/bold] (comma-separated, or press Enter for auto): "
+    ).strip() or None
+
+    console.print()
+
+    config = RunConfig(
+        target_url=url,
+        repo_url=repo,
+        brief=brief,
+        focus_flows=[f.strip() for f in focus.split(",")] if focus else [],
+        output_dir="./artifacts",
+        llm_provider="anthropic",
+        llm_model="claude-sonnet-4-20250514",
+    )
+
+    console.print(f"[bold]HumanQA[/bold] evaluating: [cyan]{url}[/cyan]")
+    if repo:
+        console.print(f"  Repository: [cyan]{repo}[/cyan]")
+    console.print()
+
+    setup_logging(verbose=True)
+
+    from humanqa.core.pipeline import run_pipeline
+
+    result = asyncio.run(run_pipeline(config))
+
+    # Print summary
+    console.print(f"\n[bold green]Evaluation complete![/bold green]")
+    console.print(f"  Issues found: [bold]{len(result.issues)}[/bold]")
+
+    severity_counts = {}
+    for issue in result.issues:
+        sev = issue.severity.value
+        severity_counts[sev] = severity_counts.get(sev, 0) + 1
+
+    for sev in ["critical", "high", "medium", "low", "info"]:
+        count = severity_counts.get(sev, 0)
+        if count:
+            color = {"critical": "red", "high": "red", "medium": "yellow", "low": "blue", "info": "dim"}.get(sev, "white")
+            console.print(f"    [{color}]{sev}: {count}[/{color}]")
+
+    console.print(f"\n  Reports: ./artifacts/")
+    console.print(f"    report.md — Human-readable report")
+    console.print(f"    report.html — Interactive HTML report")
+    console.print(f"    HANDOFF.md — Ready for Claude Code / Codex")
+    console.print(f"    handoff.json — Machine-readable handoff")
 
 
 @main.command()
