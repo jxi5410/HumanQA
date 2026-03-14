@@ -1,9 +1,8 @@
-"""Tests for handoff generation: file_mapper, HandoffGenerator, schemas, CLI."""
+"""Tests for handoff feature: schemas, FileMapper, HandoffGenerator, CLI."""
 
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -12,6 +11,7 @@ from humanqa.core.schemas import (
     AgentPersona,
     CoverageEntry,
     CoverageMap,
+    Evidence,
     FeatureExpectation,
     FeatureGap,
     Handoff,
@@ -80,74 +80,83 @@ def _make_insights(**kwargs) -> RepoInsights:
 # ===========================================================================
 
 class TestHandoffSchemas:
-    """Tests for HandoffTask, FeatureGap, Handoff models."""
+    """Tests for HandoffTask, FeatureGap, Handoff models per HANDOFF_SPEC."""
+
+    def test_handoff_task_spec_fields(self):
+        task = HandoffTask(
+            task_number=1,
+            issue_id="ISS-A1B2C3",
+            severity="critical",
+            title="Checkout form silently fails",
+            description="No error message shown",
+            likely_files=["app/checkout/page.tsx"],
+            repro_steps=["Navigate to /checkout", "Click Pay"],
+            expected_behavior="Clear error message",
+            fix_guidance="Add client-side validation",
+            verification="Fill with invalid card, assert error visible",
+            evidence_screenshots=["screenshots/step-7.png"],
+            depends_on=[],
+            blocks=[5],
+            estimated_complexity="significant",
+        )
+        assert task.task_number == 1
+        assert task.severity == "critical"
+        assert task.blocks == [5]
+        assert task.estimated_complexity == "significant"
 
     def test_handoff_task_defaults(self):
-        task = HandoffTask(issue_id="ISS-001", title="Broken button")
-        assert task.severity == Severity.medium
-        assert task.category == IssueCategory.functional
+        task = HandoffTask(task_number=1, issue_id="ISS-001", severity="medium", title="Bug")
+        assert task.description == ""
         assert task.likely_files == []
-        assert task.effort_estimate == ""
+        assert task.depends_on == []
+        assert task.blocks == []
+        assert task.estimated_complexity == "moderate"
 
-    def test_handoff_task_full(self):
-        task = HandoffTask(
-            issue_id="ISS-002",
-            title="Login fails",
-            severity=Severity.critical,
-            category=IssueCategory.functional,
-            likely_files=["/login", "src/components/"],
-            repair_brief="Fix the auth handler",
-            repro_steps=["Go to /login", "Enter credentials", "Click submit"],
-            expected="User is logged in",
-            actual="500 error returned",
-            effort_estimate="large",
+    def test_feature_gap_spec_fields(self):
+        gap = FeatureGap(
+            feature="Dark mode toggle",
+            source="README",
+            claim="supports dark/light theme",
+            ui_status="not_found",
         )
-        assert task.severity == Severity.critical
-        assert len(task.repro_steps) == 3
-        data = task.model_dump()
-        assert data["effort_estimate"] == "large"
+        assert gap.feature == "Dark mode toggle"
+        assert gap.ui_status == "not_found"
 
     def test_feature_gap_defaults(self):
-        gap = FeatureGap(feature_name="Dark mode")
-        assert gap.source == ""
-        assert gap.status == ""
-        assert gap.related_issues == []
+        gap = FeatureGap(feature="SSO", source="docs")
+        assert gap.claim == ""
+        assert gap.ui_status == "not_found"
 
-    def test_feature_gap_serialization(self):
-        gap = FeatureGap(
-            feature_name="SSO",
-            source="README",
-            status="missing",
-            details="Not found",
-            related_issues=["ISS-001"],
+    def test_handoff_spec_fields(self):
+        h = Handoff(
+            run_id="run-abc123",
+            product_name="TestApp",
+            repo_url="https://github.com/user/repo",
+            tech_stack=["Next.js", "TypeScript"],
+            target_url="https://product.com",
+            total_estimated_hours="~3-4 hours",
+            summary="15 issues found",
         )
-        data = json.loads(gap.model_dump_json())
-        assert data["feature_name"] == "SSO"
-        assert data["related_issues"] == ["ISS-001"]
-
-    def test_handoff_defaults(self):
-        h = Handoff()
-        assert h.run_id == ""
-        assert h.tasks == []
-        assert h.feature_gaps == []
-        assert h.coverage_summary == {}
+        assert h.handoff_version == "1.0"
+        assert h.repo_url == "https://github.com/user/repo"
+        assert h.tech_stack == ["Next.js", "TypeScript"]
+        assert h.total_estimated_hours == "~3-4 hours"
 
     def test_handoff_roundtrip(self):
         h = Handoff(
             run_id="run-abc",
-            product_name="TestApp",
-            target_url="https://example.com",
-            summary="Test summary",
-            tasks=[HandoffTask(issue_id="ISS-001", title="Bug")],
-            feature_gaps=[FeatureGap(feature_name="Search", status="missing")],
-            coverage_summary={"visited": 5, "failed": 1},
+            product_name="App",
+            target_url="https://app.com",
+            tasks=[HandoffTask(task_number=1, issue_id="ISS-001", severity="high", title="Bug")],
+            feature_gaps=[FeatureGap(feature="Search", source="README", ui_status="not_found")],
         )
         json_str = h.model_dump_json()
         h2 = Handoff.model_validate_json(json_str)
         assert h2.run_id == "run-abc"
         assert len(h2.tasks) == 1
+        assert h2.tasks[0].task_number == 1
         assert len(h2.feature_gaps) == 1
-        assert h2.coverage_summary["visited"] == 5
+        assert h2.feature_gaps[0].ui_status == "not_found"
 
 
 # ===========================================================================
@@ -155,81 +164,87 @@ class TestHandoffSchemas:
 # ===========================================================================
 
 class TestFileMapper:
-    """Tests for core/file_mapper.py."""
+    """Tests for core/file_mapper.py FileMapper class."""
 
-    def test_no_insights_returns_empty(self):
-        from humanqa.core.file_mapper import map_issue_to_files
+    def test_class_interface(self):
+        from humanqa.core.file_mapper import FileMapper
 
-        issue = _make_issue("Broken settings", likely_product_area="settings")
-        result = map_issue_to_files(issue, None)
-        assert result == []
-
-    def test_product_area_matches_route(self):
-        from humanqa.core.file_mapper import map_issue_to_files
-
-        issue = _make_issue("Settings broken", likely_product_area="settings")
         insights = _make_insights()
-        result = map_issue_to_files(issue, insights)
+        mapper = FileMapper(insights)
+        issue = _make_issue("Settings broken", likely_product_area="settings")
+        result = mapper.map_issue_to_files(issue)
         assert "/settings" in result
 
-    def test_title_matches_route(self):
-        from humanqa.core.file_mapper import map_issue_to_files
+    def test_no_insights_returns_empty(self):
+        from humanqa.core.file_mapper import FileMapper
 
-        issue = _make_issue("Dashboard loading slow", likely_product_area="")
+        mapper = FileMapper(None)
+        issue = _make_issue("Broken settings", likely_product_area="settings")
+        assert mapper.map_issue_to_files(issue) == []
+
+    def test_override_insights(self):
+        from humanqa.core.file_mapper import FileMapper
+
+        mapper = FileMapper(None)
         insights = _make_insights()
-        result = map_issue_to_files(issue, insights)
+        issue = _make_issue("Dashboard slow", likely_product_area="dashboard")
+        result = mapper.map_issue_to_files(issue, repo_insights=insights)
         assert "/dashboard" in result
 
-    def test_repro_step_url_matches(self):
-        from humanqa.core.file_mapper import map_issue_to_files
+    def test_product_area_matches_route(self):
+        from humanqa.core.file_mapper import FileMapper
 
+        mapper = FileMapper(_make_insights())
+        issue = _make_issue("Settings broken", likely_product_area="settings")
+        assert "/settings" in mapper.map_issue_to_files(issue)
+
+    def test_title_matches_route(self):
+        from humanqa.core.file_mapper import FileMapper
+
+        mapper = FileMapper(_make_insights())
+        issue = _make_issue("Dashboard loading slow", likely_product_area="")
+        assert "/dashboard" in mapper.map_issue_to_files(issue)
+
+    def test_repro_step_url_matches(self):
+        from humanqa.core.file_mapper import FileMapper
+
+        mapper = FileMapper(_make_insights())
         issue = _make_issue(
-            "Error on profile",
+            "Error on page",
             likely_product_area="",
             repro_steps=["Navigate to /profile", "Click edit"],
         )
-        insights = _make_insights()
-        result = map_issue_to_files(issue, insights)
-        assert "/profile" in result
-
-    def test_category_accessibility_hints(self):
-        from humanqa.core.file_mapper import map_issue_to_files
-
-        issue = _make_issue(
-            "Missing alt text",
-            category="accessibility",
-            likely_product_area="",
-        )
-        insights = _make_insights()
-        result = map_issue_to_files(issue, insights)
-        assert any("component" in f.lower() or "ARIA" in f for f in result)
+        assert "/profile" in mapper.map_issue_to_files(issue)
 
     def test_deduplication(self):
-        from humanqa.core.file_mapper import map_issue_to_files
+        from humanqa.core.file_mapper import FileMapper
 
+        mapper = FileMapper(_make_insights())
         issue = _make_issue(
-            "Settings page broken on settings view",
+            "Settings page broken",
             likely_product_area="settings",
             repro_steps=["Go to /settings"],
         )
-        insights = _make_insights()
-        result = map_issue_to_files(issue, insights)
-        # /settings should appear only once
+        result = mapper.map_issue_to_files(issue)
         assert result.count("/settings") == 1
 
     def test_caps_at_ten(self):
-        from humanqa.core.file_mapper import map_issue_to_files
+        from humanqa.core.file_mapper import FileMapper
 
-        # Create insights with many routes
         routes = [f"/page-{i}" for i in range(20)]
-        insights = _make_insights(routes_or_pages=routes)
-        # Issue whose title matches many routes
+        mapper = FileMapper(_make_insights(routes_or_pages=routes))
         issue = _make_issue(
             " ".join(f"page-{i}" for i in range(20)),
             likely_product_area="page",
         )
-        result = map_issue_to_files(issue, insights)
-        assert len(result) <= 10
+        assert len(mapper.map_issue_to_files(issue)) <= 10
+
+    def test_backward_compat_function(self):
+        from humanqa.core.file_mapper import map_issue_to_files
+
+        issue = _make_issue("Settings broken", likely_product_area="settings")
+        result = map_issue_to_files(issue, _make_insights())
+        assert "/settings" in result
 
 
 # ===========================================================================
@@ -237,7 +252,7 @@ class TestFileMapper:
 # ===========================================================================
 
 class TestHandoffGenerator:
-    """Tests for reporting/handoff.py."""
+    """Tests for reporting/handoff.py matching HANDOFF_SPEC."""
 
     def test_generate_basic(self):
         from humanqa.reporting.handoff import HandoffGenerator
@@ -250,7 +265,8 @@ class TestHandoffGenerator:
         handoff = gen.generate(result)
         assert handoff.run_id == "run-test"
         assert handoff.product_name == "TestApp"
-        assert len(handoff.tasks) == 2  # info skipped, critical + low remain
+        assert handoff.handoff_version == "1.0"
+        assert len(handoff.tasks) == 2
 
     def test_info_issues_skipped(self):
         from humanqa.reporting.handoff import HandoffGenerator
@@ -264,7 +280,7 @@ class TestHandoffGenerator:
         assert len(handoff.tasks) == 1
         assert handoff.tasks[0].title == "Real bug"
 
-    def test_tasks_sorted_by_severity(self):
+    def test_tasks_numbered_and_sorted_by_severity(self):
         from humanqa.reporting.handoff import HandoffGenerator
 
         result = _make_run_result(issues=[
@@ -274,10 +290,10 @@ class TestHandoffGenerator:
         ])
         gen = HandoffGenerator("/tmp/test_handoff_sort")
         handoff = gen.generate(result)
-        severities = [t.severity.value for t in handoff.tasks]
-        assert severities == ["critical", "high", "low"]
+        assert [t.task_number for t in handoff.tasks] == [1, 2, 3]
+        assert [t.severity for t in handoff.tasks] == ["critical", "high", "low"]
 
-    def test_effort_estimate_mapping(self):
+    def test_complexity_estimation(self):
         from humanqa.reporting.handoff import HandoffGenerator
 
         result = _make_run_result(issues=[
@@ -286,15 +302,28 @@ class TestHandoffGenerator:
             _make_issue("Med", severity="medium"),
             _make_issue("Lo", severity="low"),
         ])
-        gen = HandoffGenerator("/tmp/test_handoff_effort")
+        gen = HandoffGenerator("/tmp/test_handoff_complexity")
         handoff = gen.generate(result)
-        efforts = {t.title: t.effort_estimate for t in handoff.tasks}
-        assert efforts["Crit"] == "large"
-        assert efforts["Hi"] == "medium"
-        assert efforts["Med"] == "medium"
-        assert efforts["Lo"] == "small"
+        complexities = {t.title: t.estimated_complexity for t in handoff.tasks}
+        assert complexities["Crit"] == "significant"
+        assert complexities["Hi"] == "moderate"
+        assert complexities["Med"] == "moderate"
+        assert complexities["Lo"] == "quick_fix"
 
-    def test_feature_gaps_from_expectations(self):
+    def test_total_estimated_hours(self):
+        from humanqa.reporting.handoff import HandoffGenerator
+
+        result = _make_run_result(issues=[
+            _make_issue("Crit", severity="critical"),  # 3.0h
+            _make_issue("Lo", severity="low"),  # 0.5h
+        ])
+        gen = HandoffGenerator("/tmp/test_handoff_hours")
+        handoff = gen.generate(result)
+        # 3.0 + 0.5 = 3.5 -> "~4-5 hours" approximately
+        assert "~" in handoff.total_estimated_hours
+        assert "hours" in handoff.total_estimated_hours
+
+    def test_feature_gaps_spec_format(self):
         from humanqa.reporting.handoff import HandoffGenerator
 
         result = _make_run_result(issues=[
@@ -308,14 +337,13 @@ class TestHandoffGenerator:
         ]
         gen = HandoffGenerator("/tmp/test_handoff_gaps")
         handoff = gen.generate(result)
-        # Export is verified=True, should be excluded
         assert len(handoff.feature_gaps) == 2
-        names = {g.feature_name for g in handoff.feature_gaps}
-        assert "Search" in names
-        assert "SSO" in names
-        assert "Export" not in names
+        features = {g.feature for g in handoff.feature_gaps}
+        assert "Search" in features
+        assert "SSO" in features
+        assert "Export" not in features
 
-    def test_feature_gap_status_broken_vs_missing(self):
+    def test_feature_gap_ui_status(self):
         from humanqa.reporting.handoff import HandoffGenerator
 
         result = _make_run_result(issues=[
@@ -328,29 +356,46 @@ class TestHandoffGenerator:
         ]
         gen = HandoffGenerator("/tmp/test_handoff_status")
         handoff = gen.generate(result)
-        gap_map = {g.feature_name: g for g in handoff.feature_gaps}
-        # Search has related issues and verified=False -> broken
-        assert gap_map["Search"].status == "broken"
-        # Notifications has no related issues and verified=False -> missing
-        assert gap_map["Notifications"].status == "missing"
+        gap_map = {g.feature: g for g in handoff.feature_gaps}
+        assert gap_map["Search"].ui_status == "different"
+        assert gap_map["Notifications"].ui_status == "not_found"
 
-    def test_coverage_summary(self):
+    def test_repo_info_in_handoff(self):
         from humanqa.reporting.handoff import HandoffGenerator
 
         result = _make_run_result()
-        gen = HandoffGenerator("/tmp/test_handoff_cov")
+        result.config.repo_url = "https://github.com/user/repo"
+        insights = _make_insights()
+        gen = HandoffGenerator("/tmp/test_handoff_repo")
+        handoff = gen.generate(result, insights)
+        assert handoff.repo_url == "https://github.com/user/repo"
+        assert handoff.tech_stack == ["React", "Next.js", "Tailwind CSS"]
+
+    def test_dependency_inference(self):
+        from humanqa.reporting.handoff import HandoffGenerator
+
+        result = _make_run_result(issues=[
+            _make_issue("Checkout form broken", severity="critical",
+                        likely_product_area="checkout"),
+            _make_issue("Payment confirmation missing", severity="high",
+                        likely_product_area="confirmation",
+                        repro_steps=["Complete checkout flow", "View confirmation"]),
+        ])
+        gen = HandoffGenerator("/tmp/test_handoff_deps")
         handoff = gen.generate(result)
-        cov = handoff.coverage_summary
-        assert cov["visited"] == 2
-        assert cov["failed"] == 1
-        assert cov["pending"] == 0
-        assert len(cov["visited_urls"]) == 2
+        # Task 2's repro mentions "checkout" which is Task 1's area
+        task1 = handoff.tasks[0]
+        task2 = handoff.tasks[1]
+        assert task1.title == "Checkout form broken"
+        assert task2.depends_on == [1] or 1 in task2.depends_on
+        assert task2.task_number in task1.blocks
 
     def test_generate_all_writes_files(self, tmp_path):
         from humanqa.reporting.handoff import HandoffGenerator
 
         result = _make_run_result(issues=[
-            _make_issue("Bug A", severity="high", repair_brief="Fix A"),
+            _make_issue("Bug A", severity="high", repair_brief="Fix A",
+                        user_impact="Users can't proceed"),
             _make_issue("Bug B", severity="medium"),
         ])
         gen = HandoffGenerator(str(tmp_path))
@@ -359,37 +404,98 @@ class TestHandoffGenerator:
         assert "handoff_md" in paths
         assert "handoff_json" in paths
 
+        # Check HANDOFF.md
         md_path = Path(paths["handoff_md"])
         assert md_path.exists()
-        md_content = md_path.read_text()
-        assert "# Developer Handoff" in md_content
-        assert "Bug A" in md_content
-        assert "Bug B" in md_content
-        assert "run-test" in md_content
+        md = md_path.read_text()
+        assert "# HumanQA Handoff" in md
+        assert "## Context" in md
+        assert "## Summary" in md
+        assert "## Task 1 of 2" in md
+        assert "Bug A" in md
+        assert "**What's wrong:**" in md
+        assert "## Verification Checklist" in md
 
+        # Check handoff.json
         json_path = Path(paths["handoff_json"])
         assert json_path.exists()
         data = json.loads(json_path.read_text())
+        assert data["handoff_version"] == "1.0"
         assert data["run_id"] == "run-test"
+        assert "product" in data
+        assert data["product"]["name"] == "TestApp"
         assert len(data["tasks"]) == 2
+        assert data["tasks"][0]["task_number"] == 1
+        assert "dependency_graph" in data
 
-    def test_markdown_task_table(self, tmp_path):
+    def test_markdown_spec_format(self, tmp_path):
         from humanqa.reporting.handoff import HandoffGenerator
 
         result = _make_run_result(issues=[
             _make_issue("Login broken", severity="critical",
-                        likely_product_area="login"),
+                        likely_product_area="login",
+                        user_impact="Users cannot log in",
+                        repro_steps=["Go to /login", "Enter creds", "Click submit"],
+                        expected="User logged in",
+                        repair_brief="Fix auth handler",
+                        evidence=Evidence(screenshots=["screenshots/login-fail.png"])),
         ])
+        result.config.repo_url = "https://github.com/user/repo"
         insights = _make_insights()
         gen = HandoffGenerator(str(tmp_path))
         paths = gen.generate_all(result, insights)
 
-        md_content = Path(paths["handoff_md"]).read_text()
-        assert "| # | Severity |" in md_content
-        assert "critical" in md_content
-        assert "/login" in md_content
+        md = Path(paths["handoff_md"]).read_text()
+        assert "# HumanQA Handoff — TestApp" in md
+        assert "Repo: https://github.com/user/repo" in md
+        assert "Tech stack: React, Next.js, Tailwind CSS" in md
+        assert "## Task 1 of 1 — CRITICAL" in md
+        assert "**What's wrong:**" in md
+        assert "**Where to look:**" in md
+        assert "**Repro:**" in md
+        assert "**Expected:**" in md
+        assert "**Fix guidance:**" in md
+        assert "**Verify fix:**" in md
+        assert "**Evidence:**" in md
+        assert "**Complexity:** significant" in md
+        assert "## Verification Checklist" in md
+        assert "humanqa run" in md
 
-    def test_markdown_feature_gaps_table(self, tmp_path):
+    def test_json_spec_format(self, tmp_path):
+        from humanqa.reporting.handoff import HandoffGenerator
+
+        result = _make_run_result(issues=[
+            _make_issue("Bug", severity="high"),
+        ])
+        result.config.repo_url = "https://github.com/user/repo"
+        gen = HandoffGenerator(str(tmp_path))
+        paths = gen.generate_all(result, _make_insights())
+
+        data = json.loads(Path(paths["handoff_json"]).read_text())
+        # Check spec structure
+        assert data["product"]["repo"] == "https://github.com/user/repo"
+        assert data["product"]["tech_stack"] == ["React", "Next.js", "Tailwind CSS"]
+        task = data["tasks"][0]
+        assert "task_number" in task
+        assert "depends_on" in task
+        assert "blocks" in task
+        assert "estimated_complexity" in task
+        assert "dependency_graph" in data
+
+    def test_dependency_notes_in_markdown(self, tmp_path):
+        from humanqa.reporting.handoff import HandoffGenerator
+
+        result = _make_run_result(issues=[
+            _make_issue("A", severity="critical", likely_product_area="checkout"),
+            _make_issue("B", severity="high", likely_product_area="payment",
+                        repro_steps=["Complete checkout", "Check payment"]),
+        ])
+        gen = HandoffGenerator(str(tmp_path))
+        paths = gen.generate_all(result)
+        md = Path(paths["handoff_md"]).read_text()
+        assert "## Dependency Notes" in md
+
+    def test_feature_gaps_in_markdown(self, tmp_path):
         from humanqa.reporting.handoff import HandoffGenerator
 
         result = _make_run_result()
@@ -398,58 +504,50 @@ class TestHandoffGenerator:
         ]
         gen = HandoffGenerator(str(tmp_path))
         paths = gen.generate_all(result)
+        md = Path(paths["handoff_md"]).read_text()
+        assert "## Feature Gaps" in md
+        assert "Dark mode" in md
+        assert "not_found" in md
 
-        md_content = Path(paths["handoff_md"]).read_text()
-        assert "## Feature Gaps" in md_content
-        assert "Dark mode" in md_content
-
-    def test_summary_text(self):
+    def test_file_mapping_with_repo_insights(self, tmp_path):
         from humanqa.reporting.handoff import HandoffGenerator
 
         result = _make_run_result(issues=[
-            _make_issue("A", severity="critical"),
-            _make_issue("B", severity="high"),
-            _make_issue("C", severity="low"),
-        ])
-        gen = HandoffGenerator("/tmp/test_handoff_summary")
-        handoff = gen.generate(result)
-        assert "3 issues" in handoff.summary
-        assert "2 critical/high" in handoff.summary
-        assert "3 actionable tasks" in handoff.summary
-
-    def test_with_repo_insights_file_mapping(self, tmp_path):
-        from humanqa.reporting.handoff import HandoffGenerator
-
-        result = _make_run_result(issues=[
-            _make_issue("Settings page crash", severity="high",
+            _make_issue("Settings crash", severity="high",
                         likely_product_area="settings"),
         ])
-        insights = _make_insights()
         gen = HandoffGenerator(str(tmp_path))
-        handoff = gen.generate(result, insights)
-        assert len(handoff.tasks) == 1
+        handoff = gen.generate(result, _make_insights())
         assert "/settings" in handoff.tasks[0].likely_files
 
 
 # ===========================================================================
-# CLI handoff command tests
+# CLI tests
 # ===========================================================================
 
 class TestHandoffCLI:
-    """Tests for the CLI handoff command."""
+    """Tests for CLI handoff command and --handoff flag."""
 
     def test_handoff_command_exists(self):
-        """Verify the handoff command is registered."""
         from humanqa.cli import main
-        commands = main.commands
-        assert "handoff" in commands
+        assert "handoff" in main.commands
 
-    def test_handoff_command_with_run_dir(self, tmp_path):
-        """Test handoff command with a valid run directory."""
+    def test_handoff_command_has_format_option(self):
+        from humanqa.cli import main
+        cmd = main.commands["handoff"]
+        param_names = [p.name for p in cmd.params]
+        assert "fmt" in param_names
+
+    def test_run_command_has_handoff_option(self):
+        from humanqa.cli import main
+        cmd = main.commands["run"]
+        param_names = [p.name for p in cmd.params]
+        assert "handoff_format" in param_names
+
+    def test_handoff_command_generates_files(self, tmp_path):
         from click.testing import CliRunner
         from humanqa.cli import main
 
-        # Create a minimal report.json
         result = _make_run_result(issues=[
             _make_issue("Test bug", severity="high"),
         ])
@@ -460,13 +558,24 @@ class TestHandoffCLI:
         res = runner.invoke(main, ["handoff", str(tmp_path)])
         assert res.exit_code == 0
         assert "Handoff generated" in res.output
-
-        # Check files were created
         assert (tmp_path / "HANDOFF.md").exists()
         assert (tmp_path / "handoff.json").exists()
 
-    def test_handoff_command_missing_run_dir(self):
-        """Test handoff command with nonexistent directory."""
+    def test_handoff_command_with_format(self, tmp_path):
+        from click.testing import CliRunner
+        from humanqa.cli import main
+
+        result = _make_run_result(issues=[
+            _make_issue("Bug", severity="medium"),
+        ])
+        (tmp_path / "report.json").write_text(result.model_dump_json(indent=2))
+
+        runner = CliRunner()
+        res = runner.invoke(main, ["handoff", str(tmp_path), "--format", "claude-code"])
+        assert res.exit_code == 0
+        assert "claude-code" in res.output
+
+    def test_handoff_command_missing_dir(self):
         from click.testing import CliRunner
         from humanqa.cli import main
 
@@ -474,11 +583,15 @@ class TestHandoffCLI:
         res = runner.invoke(main, ["handoff", "/nonexistent/path"])
         assert res.exit_code != 0
 
-    def test_run_command_shows_handoff_in_output(self):
-        """Verify the run command output mentions handoff files."""
+    def test_handoff_shows_scope(self, tmp_path):
+        from click.testing import CliRunner
         from humanqa.cli import main
-        # Check that the CLI source references handoff in output
-        import inspect
-        source = inspect.getsource(main.commands["run"].callback)
-        assert "HANDOFF.md" in source
-        assert "handoff.json" in source
+
+        result = _make_run_result(issues=[
+            _make_issue("Bug", severity="critical"),
+        ])
+        (tmp_path / "report.json").write_text(result.model_dump_json(indent=2))
+
+        runner = CliRunner()
+        res = runner.invoke(main, ["handoff", str(tmp_path)])
+        assert "Estimated scope" in res.output
