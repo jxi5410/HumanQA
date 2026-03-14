@@ -276,4 +276,182 @@ The design lens currently reviews artifacts generically. It must specifically re
 8. **Login/auth flow evaluation (without credentials)**
 9. **Mobile responsiveness & visual layout evaluation**
 10. Run time optimizations (timeouts, exploration caps, lens parallelization)
-11. Tests for all of the above
+11. **Multi-provider tiered model support (see section 10 below)**
+12. Tests for all of the above
+
+---
+
+## 10. Multi-Provider Tiered Model Support
+
+### Problem
+Running HumanQA entirely on Claude Sonnet 4.6 ($3/$15 per 1M tokens) is expensive. A single run with 40+ LLM calls costs $3-5. Most of those calls don't need frontier-tier quality — per-page evaluations, action planning, and screenshot analysis can use a cheaper model. Only high-judgment steps (intent modeling, persona generation, final dedup, report narrative) benefit from the best model.
+
+### Architecture: Tiered Model Routing
+
+Every LLM call in the pipeline gets tagged with a "tier" that determines which model handles it. Two tiers:
+
+**Fast tier** — high-volume, per-step calls. Needs good vision, decent JSON output, fast response. Default: `gemini-3-flash` ($0.50/$3.00).
+
+Used for: per-page evaluation, action planning, screenshot analysis, navigation decisions, mobile responsiveness checks, trust signal checks, individual auth flow evaluation steps.
+
+**Smart tier** — low-volume, high-judgment calls. Needs best reasoning, strong instruction following, nuanced output. Default: `gemini-3.1-pro-preview` ($2.00/$12.00).
+
+Used for: product intent modeling, persona generation, journey assignment, issue deduplication/clustering, issue grouping, comparative evaluation synthesis, report narrative generation, handoff task generation.
+
+### Cost Impact
+Estimated per-run cost drops from $3-5 (all Claude Sonnet) to $0.50-0.80 (tiered Gemini). That's an 80-85% reduction.
+
+### Schema Changes
+
+Add to `schemas.py`:
+
+```python
+class ModelTier(str, Enum):
+    fast = "fast"
+    smart = "smart"
+
+class TieredModelConfig(BaseModel):
+    """Model configuration with separate fast and smart tiers."""
+    fast_provider: str = "google"
+    fast_model: str = "gemini-3-flash"
+    smart_provider: str = "google"
+    smart_model: str = "gemini-3.1-pro-preview"
+    
+    # Presets for common configurations
+    @classmethod
+    def budget(cls) -> "TieredModelConfig":
+        """Cheapest option. Gemini Flash for everything."""
+        return cls(
+            fast_provider="google", fast_model="gemini-2.5-flash",
+            smart_provider="google", smart_model="gemini-3-flash",
+        )
+    
+    @classmethod
+    def balanced(cls) -> "TieredModelConfig":
+        """Best value. Gemini Flash + Gemini 3.1 Pro."""
+        return cls(
+            fast_provider="google", fast_model="gemini-3-flash",
+            smart_provider="google", smart_model="gemini-3.1-pro-preview",
+        )
+    
+    @classmethod
+    def premium(cls) -> "TieredModelConfig":
+        """Best quality. Claude Sonnet + Claude Opus."""
+        return cls(
+            fast_provider="anthropic", fast_model="claude-sonnet-4-20250514",
+            smart_provider="anthropic", smart_model="claude-opus-4-6-20250514",
+        )
+    
+    @classmethod
+    def openai(cls) -> "TieredModelConfig":
+        """OpenAI stack. GPT-4.1 + GPT-5.4."""
+        return cls(
+            fast_provider="openai", fast_model="gpt-4.1",
+            smart_provider="openai", smart_model="gpt-5.4",
+        )
+```
+
+Update `RunConfig` to accept tiered config:
+```python
+class RunConfig(BaseModel):
+    # ... existing fields ...
+    model_tier: TieredModelConfig = Field(default_factory=TieredModelConfig.balanced)
+    # Deprecated but kept for backward compat:
+    llm_provider: str = "google"
+    llm_model: str = "gemini-3-flash"
+```
+
+### LLM Client Changes
+
+**Add Google Gemini provider to `llm.py`.**
+
+Install `google-genai` (the official Google Gen AI SDK). Add provider="google" support for both text and vision calls. The Gemini API accepts image bytes directly in the content array, similar to Anthropic's vision API.
+
+```python
+# In LLMClient.__init__:
+elif provider == "google":
+    import google.genai as genai
+    self._client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY", ""))
+```
+
+**Update LLMClient to accept a tier parameter:**
+
+```python
+class LLMClient:
+    def __init__(self, tier_config: TieredModelConfig):
+        self.tier_config = tier_config
+        self._clients = {}  # Lazy-init per provider
+    
+    def complete(self, prompt, system="", tier: ModelTier = ModelTier.fast, ...):
+        provider, model = self._get_provider_model(tier)
+        # Route to correct provider
+    
+    def complete_with_vision(self, prompt, images, tier: ModelTier = ModelTier.fast, ...):
+        # Same routing with vision support
+```
+
+### Pipeline Changes
+
+Tag every LLM call in the codebase with the appropriate tier:
+
+| Module | Call | Tier |
+|--------|------|------|
+| `intent_modeler.py` | Build intent model | smart |
+| `persona_generator.py` | Generate personas | smart |
+| `orchestrator.py` | Assign journeys | smart |
+| `orchestrator.py` | Comparative evaluation | smart |
+| `orchestrator.py` | LLM deduplication | smart |
+| `web_runner.py` | Plan actions | fast |
+| `web_runner.py` | Evaluate page | fast |
+| `web_runner.py` | Navigate/explore | fast |
+| `design_lens.py` | Design review | fast |
+| `trust_lens.py` | Trust signal checks | fast |
+| `institutional_lens.py` | Institutional review | smart |
+| `report_generator.py` | Report narrative | smart |
+| `handoff.py` | Generate handoff tasks | smart |
+
+### CLI Changes
+
+```bash
+# Use presets
+humanqa run https://example.com --tier balanced    # Default: Gemini Flash + 3.1 Pro
+humanqa run https://example.com --tier budget      # Cheapest: all Gemini Flash
+humanqa run https://example.com --tier premium     # Best: Claude Sonnet + Opus
+humanqa run https://example.com --tier openai      # OpenAI: GPT-4.1 + GPT-5.4
+
+# Or specify models directly
+humanqa run https://example.com --fast-model gemini-3-flash --smart-model gemini-3.1-pro-preview
+
+# In interactive mode, ask the user
+# "Which quality tier? [balanced/budget/premium/openai]"
+```
+
+### Environment Variables
+
+```bash
+# One of these required depending on tier:
+GOOGLE_API_KEY=...      # For Gemini models (default tier)
+ANTHROPIC_API_KEY=...   # For Claude models (premium tier)
+OPENAI_API_KEY=...      # For OpenAI models (openai tier)
+```
+
+### pyproject.toml
+
+Add `google-genai>=1.0.0` to dependencies.
+
+### Backward Compatibility
+
+The old `--provider` and `--model` flags should still work. If set, they override both fast and smart tiers to use that single provider/model (the old behavior). The new `--tier` flag takes precedence if both are specified.
+
+### Interactive Mode Update
+
+In interactive mode, after asking for URL and repo, add:
+
+```
+Which quality tier? (balanced is recommended for most users)
+  1. balanced — Best value, ~$0.50-0.80/run (Gemini Flash + Pro)
+  2. budget — Cheapest, ~$0.20-0.40/run (Gemini Flash only)  
+  3. premium — Best quality, ~$3-5/run (Claude Sonnet + Opus)
+  4. openai — OpenAI stack, ~$2-4/run (GPT-4.1 + GPT-5.4)
+Choose [1-4, default 1]:
+```
