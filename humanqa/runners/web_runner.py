@@ -121,8 +121,14 @@ Style: {behavioral_style}
 Evaluate this page from your persona's perspective. The screenshot is attached as an image.
 Find issues with specific evidence. Respond with JSON."""
 
-# Default max steps per journey
-DEFAULT_MAX_STEPS = 10
+# Default max steps per journey (exploration cap)
+DEFAULT_MAX_STEPS = 8
+
+# Timeout for individual page navigation
+PAGE_NAVIGATION_TIMEOUT_MS = 20000
+
+# Timeout for individual action execution
+ACTION_TIMEOUT_MS = 10000
 
 
 class WebRunner:
@@ -197,7 +203,7 @@ class WebRunner:
                 await page.goto(
                     config.target_url,
                     wait_until="domcontentloaded",
-                    timeout=30000,
+                    timeout=PAGE_NAVIGATION_TIMEOUT_MS,
                 )
                 load_time_ms = int((time.monotonic() - start) * 1000)
 

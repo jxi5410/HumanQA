@@ -1,12 +1,14 @@
 """Main evaluation pipeline.
 
 Orchestrates the full end-to-end flow:
-1. Scrape target → 2. Build intent model → 3. Generate personas →
-4. Orchestrate evaluation → 5. Apply specialist lenses → 6. Generate reports
+1. Scrape target -> 2. Build intent model -> 3. Generate personas ->
+4. Orchestrate evaluation -> 5. Apply specialist lenses (parallelized) ->
+6. Generate reports
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -28,6 +30,33 @@ from humanqa.runners.web_runner import WebRunner
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Timeout and cap constants
+# ---------------------------------------------------------------------------
+
+STEP_TIMEOUT_SECONDS = {
+    "repo": 60,
+    "scrape": 30,
+    "intent": 30,
+    "personas": 20,
+    "evaluate": 300,  # 5 min cap for full evaluation
+    "lenses": 120,  # 2 min cap for all lenses combined
+    "reports": 30,
+    "handoff": 15,
+}
+
+MAX_JOURNEYS_PER_AGENT = 3  # Cap journeys to avoid long runs
+MAX_AGENTS = 6  # Cap persona count
+
+
+async def _with_timeout(coro, timeout_sec: float, label: str):
+    """Run a coroutine with a timeout, logging on timeout."""
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout_sec)
+    except asyncio.TimeoutError:
+        logger.warning("Step '%s' timed out after %ds", label, timeout_sec)
+        return None
+
 
 async def run_pipeline(config: RunConfig) -> RunResult:
     """Execute the complete HumanQA evaluation pipeline."""
@@ -48,20 +77,31 @@ async def run_pipeline(config: RunConfig) -> RunResult:
     if config.repo_url:
         progress.start_step("repo", config.repo_url)
         repo_analyzer = RepoAnalyzer(llm)
-        repo_insights = await repo_analyzer.analyze(
-            config.repo_url, config.github_token_env
-        )
-        progress.complete_step(
+        repo_insights = await _with_timeout(
+            repo_analyzer.analyze(config.repo_url, config.github_token_env),
+            STEP_TIMEOUT_SECONDS["repo"],
             "repo",
-            f"Found: {repo_insights.product_name}, "
-            f"{len(repo_insights.claimed_features)} features, "
-            f"{len(repo_insights.routes_or_pages)} routes"
         )
+        if repo_insights:
+            progress.complete_step(
+                "repo",
+                f"Found: {repo_insights.product_name}, "
+                f"{len(repo_insights.claimed_features)} features, "
+                f"{len(repo_insights.routes_or_pages)} routes"
+            )
+        else:
+            progress.complete_step("repo", "Timed out — continuing without repo insights")
 
     # Step 1b: Scrape landing page
     progress.start_step("scrape", config.target_url)
     web_runner = WebRunner(llm, config.output_dir)
-    page_content = await web_runner.scrape_landing_page(config.target_url)
+    page_content = await _with_timeout(
+        web_runner.scrape_landing_page(config.target_url),
+        STEP_TIMEOUT_SECONDS["scrape"],
+        "scrape",
+    )
+    if page_content is None:
+        page_content = "(scrape timed out)"
     progress.complete_step("scrape", f"Loaded {len(page_content)} chars of visible content")
 
     # Step 2: Build Product Intent Model
@@ -76,68 +116,141 @@ async def run_pipeline(config: RunConfig) -> RunResult:
         f"{len(intent.critical_journeys)} journeys identified"
     )
 
+    # Cap journeys to prevent long runs
+    if len(intent.critical_journeys) > MAX_JOURNEYS_PER_AGENT * 2:
+        logger.info(
+            "Capping journeys from %d to %d",
+            len(intent.critical_journeys),
+            MAX_JOURNEYS_PER_AGENT * 2,
+        )
+        intent.critical_journeys = intent.critical_journeys[:MAX_JOURNEYS_PER_AGENT * 2]
+
     # Step 3: Generate agent personas
     progress.start_step("personas")
     persona_gen = PersonaGenerator(llm)
     agents = await persona_gen.generate_personas(intent, config)
+    # Cap agent count
+    if len(agents) > MAX_AGENTS:
+        logger.info("Capping agents from %d to %d", len(agents), MAX_AGENTS)
+        agents = agents[:MAX_AGENTS]
     progress.update_stats(agents=len(agents))
     progress.complete_step("personas", f"{len(agents)} personas: " + ", ".join(a.name for a in agents[:4]))
 
-    # Step 4: Orchestrate evaluation
-    progress.start_step("evaluate", f"{len(agents)} agents × {len(intent.critical_journeys)} journeys")
+    # Step 4: Orchestrate evaluation (with timeout)
+    progress.start_step("evaluate", f"{len(agents)} agents x {len(intent.critical_journeys)} journeys")
     orchestrator = Orchestrator(llm, config.output_dir)
 
-    # Patch orchestrator to report per-agent progress
-    original_run = orchestrator.run
+    result = await _with_timeout(
+        orchestrator.run(config, intent, agents),
+        STEP_TIMEOUT_SECONDS["evaluate"],
+        "evaluate",
+    )
 
-    async def run_with_progress(cfg, intent_model, agent_list):
-        result = await original_run(cfg, intent_model, agent_list)
-        return result
+    if result is None:
+        # Evaluation timed out — create minimal result
+        result = RunResult(
+            config=config,
+            intent_model=intent,
+            agents=agents,
+            started_at=datetime.now(tz=timezone.utc),
+        )
+        logger.warning("Evaluation timed out — running lenses with partial results")
 
-    result = await orchestrator.run(config, intent, agents)
     progress.update_stats(issues=len(result.issues))
     progress.complete_step("evaluate", f"{len(result.issues)} issues found across {len(agents)} agents")
 
-    # Step 5: Specialist lenses
-    if config.design_review:
-        progress.start_step("design")
+    # Step 5: Specialist lenses — run in parallel for speed
+    progress.start_step("lenses", "Running design, trust, responsive, auth lenses in parallel")
+
+    async def run_design():
+        if not config.design_review:
+            return []
         design_lens = DesignLens(llm, config.output_dir)
-        design_issues = await design_lens.review(result, config.design_guidance)
-        result.issues.extend(design_issues)
-        progress.complete_step("design", f"{len(design_issues)} design issues")
+        return await design_lens.review(result, config.design_guidance)
 
-    progress.start_step("trust")
-    trust_lens = TrustLens(llm)
-    trust_issues, trust_scorecard = await trust_lens.review(result)
-    result.issues.extend(trust_issues)
-    progress.complete_step(
-        "trust",
-        f"Trust score: {trust_scorecard.overall_score:.0%}, {len(trust_issues)} issues"
-    )
+    async def run_trust():
+        trust_lens = TrustLens(llm)
+        issues, scorecard = await trust_lens.review(result)
+        return issues, scorecard
 
-    # Responsive/mobile layout evaluation
-    progress.start_step("responsive")
-    responsive_lens = ResponsiveLens(llm)
-    responsive_issues, responsive_score = await responsive_lens.review(result)
-    result.issues.extend(responsive_issues)
-    result.scores["responsive_score"] = responsive_score
-    progress.complete_step(
-        "responsive",
-        f"{len(responsive_issues)} responsive issues, score={responsive_score:.0%}"
-    )
+    async def run_responsive():
+        responsive_lens = ResponsiveLens(llm)
+        return await responsive_lens.review(result)
 
-    # Auth/login flow evaluation (no credentials needed)
-    progress.start_step("auth")
-    auth_lens = AuthLens(llm)
-    auth_issues = await auth_lens.review(result)
-    result.issues.extend(auth_issues)
-    progress.complete_step("auth", f"{len(auth_issues)} auth/login issues")
+    async def run_auth():
+        auth_lens = AuthLens(llm)
+        return await auth_lens.review(result)
 
+    # Execute all lenses concurrently with timeout
+    lens_tasks = [
+        asyncio.create_task(run_design()),
+        asyncio.create_task(run_trust()),
+        asyncio.create_task(run_responsive()),
+        asyncio.create_task(run_auth()),
+    ]
+
+    try:
+        done, pending = await asyncio.wait(
+            lens_tasks,
+            timeout=STEP_TIMEOUT_SECONDS["lenses"],
+        )
+        # Cancel any timed-out lenses
+        for task in pending:
+            task.cancel()
+            logger.warning("Lens task timed out and was cancelled")
+    except Exception as e:
+        logger.warning("Lens parallelization error: %s", e)
+        done = set()
+
+    # Collect results from completed lenses
+    lens_summary_parts = []
+    for task in done:
+        try:
+            task_result = task.result()
+            if task_result is None:
+                continue
+
+            # Design lens returns list[Issue]
+            if isinstance(task_result, list):
+                result.issues.extend(task_result)
+                lens_summary_parts.append(f"{len(task_result)} design")
+
+            # Trust lens returns (list[Issue], TrustScorecard)
+            elif isinstance(task_result, tuple) and len(task_result) == 2:
+                issues_or_score, second = task_result
+                if isinstance(issues_or_score, list):
+                    # Trust: (issues, scorecard)
+                    result.issues.extend(issues_or_score)
+                    if hasattr(second, 'overall_score'):
+                        lens_summary_parts.append(
+                            f"trust={second.overall_score:.0%}"
+                        )
+                    else:
+                        # Responsive: (issues, score)
+                        result.scores["responsive_score"] = second
+                        lens_summary_parts.append(
+                            f"responsive={second:.0%}"
+                        )
+                else:
+                    # Responsive returns (issues, float)
+                    result.issues.extend(issues_or_score)
+                    result.scores["responsive_score"] = second
+        except Exception as e:
+            logger.warning("Error collecting lens result: %s", e)
+
+    progress.complete_step("lenses", ", ".join(lens_summary_parts) or "complete")
+
+    # Institutional lens runs separately (may be skipped)
     if inst_lens.should_run(intent, config.institutional_review):
         progress.start_step("institutional")
-        inst_issues = await inst_lens.review(result)
-        result.issues.extend(inst_issues)
-        progress.complete_step("institutional", f"{len(inst_issues)} governance issues")
+        inst_issues = await _with_timeout(
+            inst_lens.review(result),
+            60,
+            "institutional",
+        )
+        if inst_issues:
+            result.issues.extend(inst_issues)
+        progress.complete_step("institutional", f"{len(inst_issues or [])} governance issues")
 
     # Re-sort all issues
     result.issues.sort(
