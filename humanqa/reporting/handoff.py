@@ -13,6 +13,7 @@ from pathlib import Path
 from humanqa.core.file_mapper import FileMapper
 from humanqa.core.schemas import (
     FeatureGap,
+    FixOption,
     Handoff,
     HandoffTask,
     RepoInsights,
@@ -140,6 +141,9 @@ class HandoffGenerator:
                     f"'{issue.likely_product_area or 'the affected area'}'."
                 )
 
+            # Generate fix options based on severity and category
+            fix_options = self._generate_fix_options(issue, complexity)
+
             task = HandoffTask(
                 task_number=task_num,
                 issue_id=issue.id,
@@ -150,6 +154,7 @@ class HandoffGenerator:
                 repro_steps=issue.repro_steps,
                 expected_behavior=issue.expected,
                 fix_guidance=issue.repair_brief,
+                fix_options=fix_options,
                 verification=verification,
                 evidence_screenshots=issue.evidence.screenshots,
                 estimated_complexity=complexity,
@@ -157,6 +162,58 @@ class HandoffGenerator:
             tasks.append(task)
 
         return tasks
+
+    @staticmethod
+    def _generate_fix_options(issue, complexity: str) -> list[FixOption]:
+        """Generate fix options based on issue characteristics."""
+        options: list[FixOption] = []
+        cat = issue.category.value
+
+        if complexity == "significant":
+            options.append(FixOption(
+                approach="Quick patch",
+                description=f"Address the immediate symptom: {issue.repair_brief or issue.title}",
+                trade_offs="Fast to ship but may not address root cause. Good for urgent customer-facing issues.",
+                estimated_effort="quick_fix",
+            ))
+            options.append(FixOption(
+                approach="Proper fix",
+                description=f"Fix the underlying issue in {issue.likely_product_area or 'the affected area'}",
+                trade_offs="Takes longer but prevents recurrence. Recommended for production stability.",
+                estimated_effort="significant",
+            ))
+        elif complexity == "moderate":
+            options.append(FixOption(
+                approach="Direct fix",
+                description=issue.repair_brief or f"Fix {issue.title}",
+                trade_offs="Standard fix — moderate effort with good coverage.",
+                estimated_effort="moderate",
+            ))
+        else:
+            options.append(FixOption(
+                approach="Quick fix",
+                description=issue.repair_brief or f"Fix {issue.title}",
+                trade_offs="Straightforward change, low risk.",
+                estimated_effort="quick_fix",
+            ))
+
+        # Category-specific options
+        if cat == "accessibility":
+            options.append(FixOption(
+                approach="ARIA/semantic HTML update",
+                description="Add appropriate ARIA attributes or switch to semantic HTML elements",
+                trade_offs="Usually low-risk and improves screen reader compatibility.",
+                estimated_effort="quick_fix",
+            ))
+        elif cat == "performance":
+            options.append(FixOption(
+                approach="Optimization pass",
+                description="Profile and optimize the slow path (lazy loading, code splitting, caching)",
+                trade_offs="May require architecture changes if the bottleneck is structural.",
+                estimated_effort="moderate",
+            ))
+
+        return options
 
     def _infer_dependencies(
         self, tasks: list[HandoffTask], result: RunResult
@@ -279,6 +336,13 @@ class HandoffGenerator:
             if task.fix_guidance:
                 lines.append(f"**Fix guidance:** {task.fix_guidance}")
 
+            if task.fix_options:
+                lines.append("**Fix options:**")
+                for opt in task.fix_options:
+                    lines.append(f"  - *{opt.approach}* ({opt.estimated_effort}): {opt.description}")
+                    if opt.trade_offs:
+                        lines.append(f"    Trade-offs: {opt.trade_offs}")
+
             if task.verification:
                 lines.append(f"**Verify fix:** {task.verification}")
 
@@ -349,6 +413,15 @@ class HandoffGenerator:
                     "repro_steps": t.repro_steps,
                     "expected_behavior": t.expected_behavior,
                     "fix_guidance": t.fix_guidance,
+                    "fix_options": [
+                        {
+                            "approach": o.approach,
+                            "description": o.description,
+                            "trade_offs": o.trade_offs,
+                            "estimated_effort": o.estimated_effort,
+                        }
+                        for o in t.fix_options
+                    ],
                     "verification": t.verification,
                     "evidence_screenshots": t.evidence_screenshots,
                     "depends_on": t.depends_on,

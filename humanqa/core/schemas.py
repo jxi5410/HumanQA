@@ -324,6 +324,14 @@ class CoverageMap(BaseModel):
 # Run Result
 # ---------------------------------------------------------------------------
 
+class FixOption(BaseModel):
+    """One possible approach to fixing an issue."""
+    approach: str  # Short label, e.g. "Quick patch" or "Proper refactor"
+    description: str = ""  # What to do
+    trade_offs: str = ""  # Pros/cons of this approach
+    estimated_effort: str = "moderate"  # quick_fix | moderate | significant
+
+
 class HandoffTask(BaseModel):
     """A single actionable task for an AI coding tool."""
     task_number: int
@@ -335,6 +343,7 @@ class HandoffTask(BaseModel):
     repro_steps: list[str] = Field(default_factory=list)
     expected_behavior: str = ""
     fix_guidance: str = ""
+    fix_options: list[FixOption] = Field(default_factory=list)
     verification: str = ""
     evidence_screenshots: list[str] = Field(default_factory=list)
     depends_on: list[int] = Field(default_factory=list)
