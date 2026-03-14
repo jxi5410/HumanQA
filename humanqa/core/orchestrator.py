@@ -21,6 +21,7 @@ from humanqa.core.schemas import (
     CoverageMap,
     Issue,
     IssueCategory,
+    IssueGroup,
     PageSnapshot,
     Platform,
     ProductIntentModel,
@@ -135,6 +136,64 @@ to agents so that:
 Respond with JSON: {{"assignments": [{{"agent_id": "...", "journeys": ["...", "..."]}}]}}"""
 
 
+def compute_error_signature(issue: Issue) -> str:
+    """Compute a normalized fingerprint for deduplication.
+
+    Combines category, product area, and normalized title keywords
+    into a stable key that identifies the same underlying problem
+    regardless of wording differences.
+    """
+    import re
+
+    # Normalize title: lowercase, strip punctuation, sort words
+    title_words = sorted(set(re.sub(r"[^a-z0-9 ]", "", issue.title.lower()).split()))
+    # Keep top 5 distinctive words (skip very short words)
+    title_key = "|".join(w for w in title_words if len(w) >= 3)[:100]
+    area = issue.likely_product_area.lower().strip()
+    cat = issue.category.value
+    return f"{cat}:{area}:{title_key}"
+
+
+def group_issues(issues: list[Issue]) -> list[IssueGroup]:
+    """Group issues by category + product area into IssueGroups."""
+    from collections import defaultdict
+
+    buckets: dict[str, list[Issue]] = defaultdict(list)
+    for issue in issues:
+        area = issue.likely_product_area.strip() or "General"
+        key = f"{issue.category.value}:{area.lower()}"
+        buckets[key].append(issue)
+
+    groups: list[IssueGroup] = []
+    for key, bucket in buckets.items():
+        if len(bucket) < 2:
+            continue  # Only group when there are multiple related issues
+
+        # Highest severity in the group
+        sev_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
+        best_sev = min(bucket, key=lambda i: sev_order.get(i.severity.value, 5)).severity
+
+        area = bucket[0].likely_product_area.strip() or "General"
+        cat = bucket[0].category
+
+        group = IssueGroup(
+            title=f"{cat.value.replace('_', ' ').title()} issues in {area}",
+            description=f"{len(bucket)} related {cat.value} issues in the {area} area",
+            category=cat,
+            severity=best_sev,
+            issue_ids=[i.id for i in bucket],
+            product_area=area,
+            issue_count=len(bucket),
+        )
+
+        for issue in bucket:
+            issue.group_id = group.id
+
+        groups.append(group)
+
+    return groups
+
+
 class Orchestrator:
     """Coordinates the full evaluation run across all agents."""
 
@@ -211,14 +270,19 @@ class Orchestrator:
         )
         all_issues.extend(perf_issues)
 
-        # Step 5: Deduplicate
+        # Step 5: Compute error signatures for dedup
+        for issue in all_issues:
+            if not issue.error_signature:
+                issue.error_signature = compute_error_signature(issue)
+
+        # Step 6: Deduplicate
         deduped = self._deduplicate_issues(all_issues)
 
-        # Step 6: Comparative evaluation across personas
+        # Step 7: Comparative evaluation across personas
         comparative_issues = self._comparative_evaluation(deduped, agents, coverage)
         deduped.extend(comparative_issues)
 
-        # Step 7: Rank by severity and confidence
+        # Step 8: Rank by severity and confidence
         ranked = sorted(
             deduped,
             key=lambda i: (
@@ -227,7 +291,11 @@ class Orchestrator:
             ),
         )
 
+        # Step 9: Group related issues
+        issue_groups = group_issues(ranked)
+
         result.issues = ranked
+        result.issue_groups = issue_groups
         result.coverage = coverage
         result.scores.update(perf_scores)
         result.completed_at = datetime.now(tz=__import__("datetime").timezone.utc)

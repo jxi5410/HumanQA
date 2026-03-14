@@ -237,6 +237,20 @@ class Issue(BaseModel):
     evidence: Evidence = Field(default_factory=Evidence)
     likely_product_area: str = ""
     repair_brief: str = ""
+    error_signature: str = ""  # Dedup key: normalized fingerprint of the issue
+    group_id: str = ""  # ID of the IssueGroup this belongs to
+
+
+class IssueGroup(BaseModel):
+    """A cluster of related issues grouped by theme or root cause."""
+    id: str = Field(default_factory=lambda: f"GRP-{uuid.uuid4().hex[:6].upper()}")
+    title: str  # Human-readable group name
+    description: str = ""
+    category: IssueCategory = IssueCategory.functional
+    severity: Severity = Severity.medium  # Highest severity in group
+    issue_ids: list[str] = Field(default_factory=list)
+    product_area: str = ""
+    issue_count: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -358,6 +372,7 @@ class RunResult(BaseModel):
     intent_model: ProductIntentModel = Field(default_factory=ProductIntentModel)
     agents: list[AgentPersona] = Field(default_factory=list)
     issues: list[Issue] = Field(default_factory=list)
+    issue_groups: list[IssueGroup] = Field(default_factory=list)
     coverage: CoverageMap = Field(default_factory=CoverageMap)
     summary: str = ""
     scores: dict[str, float] = Field(default_factory=dict)
