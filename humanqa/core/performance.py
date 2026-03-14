@@ -61,31 +61,33 @@ METRIC_UNITS: dict[str, str] = {
 }
 
 
-PRODUCT_TYPE_ALIASES: dict[str, str] = {
-    "marketing_site": "marketing_site",
-    "marketing": "marketing_site",
-    "landing": "marketing_site",
-    "landing_page": "marketing_site",
-    "brochure": "marketing_site",
-    "portfolio": "marketing_site",
-    "saas_app": "saas_app",
-    "saas": "saas_app",
-    "dashboard": "saas_app",
-    "platform": "saas_app",
-    "tool": "saas_app",
-    "mobile_web": "mobile_web",
-    "mobile": "mobile_web",
-    "ecommerce": "ecommerce",
-    "e-commerce": "ecommerce",
-    "marketplace": "ecommerce",
-    "store": "ecommerce",
-    "content": "content_site",
-    "blog": "content_site",
-    "news": "content_site",
-    "documentation": "content_site",
-    "docs": "content_site",
-    "wiki": "content_site",
-}
+# Ordered from most-specific to least-specific to avoid false matches.
+# "ecommerce platform" should match ecommerce, not platform->saas_app.
+PRODUCT_TYPE_ALIASES: list[tuple[str, str]] = [
+    ("ecommerce", "ecommerce"),
+    ("e-commerce", "ecommerce"),
+    ("marketplace", "ecommerce"),
+    ("store", "ecommerce"),
+    ("marketing_site", "marketing_site"),
+    ("marketing", "marketing_site"),
+    ("landing_page", "marketing_site"),
+    ("landing", "marketing_site"),
+    ("brochure", "marketing_site"),
+    ("portfolio", "marketing_site"),
+    ("mobile_web", "mobile_web"),
+    ("mobile", "mobile_web"),
+    ("documentation", "content_site"),
+    ("content", "content_site"),
+    ("blog", "content_site"),
+    ("news", "content_site"),
+    ("docs", "content_site"),
+    ("wiki", "content_site"),
+    ("saas_app", "saas_app"),
+    ("saas", "saas_app"),
+    ("dashboard", "saas_app"),
+    ("platform", "saas_app"),
+    ("tool", "saas_app"),
+]
 
 # Ecommerce and content site budgets
 BUDGETS["ecommerce"] = {
@@ -110,8 +112,8 @@ def classify_product_type(product_type: str) -> str:
     """
     pt = product_type.lower().strip()
 
-    # Direct alias match
-    for keyword, category in PRODUCT_TYPE_ALIASES.items():
+    # Direct alias match (ordered by specificity)
+    for keyword, category in PRODUCT_TYPE_ALIASES:
         if keyword in pt:
             return category
 
