@@ -12,13 +12,10 @@ Entry point:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import sys
 from pathlib import Path
-
-from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
 
@@ -28,26 +25,16 @@ logger = logging.getLogger(__name__)
 
 try:
     from mcp.server.fastmcp import FastMCP
+    _HAS_MCP = True
 except ImportError:
-    print(
-        "MCP server requires the 'mcp' package. Install with:\n"
-        "  pip install mcp\n",
-        file=sys.stderr,
-    )
-    sys.exit(1)
-
-mcp = FastMCP(
-    "HumanQA",
-    description="External-experience AI QA system — evaluates products like real users would",
-)
+    _HAS_MCP = False
 
 
 # ---------------------------------------------------------------------------
-# Tool: humanqa_quick_check
+# Tool implementations (standalone async functions, testable without mcp)
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-async def humanqa_quick_check(
+async def _quick_check_impl(
     url: str,
     focus: str = "",
     tier: str = "balanced",
@@ -72,12 +59,7 @@ async def humanqa_quick_check(
     return result.model_dump_json(indent=2)
 
 
-# ---------------------------------------------------------------------------
-# Tool: humanqa_evaluate
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-async def humanqa_evaluate(
+async def _evaluate_impl(
     url: str,
     repo_url: str = "",
     brief: str = "",
@@ -167,12 +149,7 @@ async def humanqa_evaluate(
     return json.dumps(summary, indent=2)
 
 
-# ---------------------------------------------------------------------------
-# Tool: humanqa_get_report
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-async def humanqa_get_report(
+async def _get_report_impl(
     run_dir: str = "./artifacts",
     format: str = "markdown",
 ) -> str:
@@ -216,12 +193,7 @@ async def humanqa_get_report(
     return content
 
 
-# ---------------------------------------------------------------------------
-# Tool: humanqa_compare
-# ---------------------------------------------------------------------------
-
-@mcp.tool()
-async def humanqa_compare(
+async def _compare_impl(
     baseline_dir: str,
     current_dir: str,
 ) -> str:
@@ -288,12 +260,115 @@ async def humanqa_compare(
 
 
 # ---------------------------------------------------------------------------
+# Public aliases (used by tests and direct callers)
+# ---------------------------------------------------------------------------
+
+humanqa_quick_check = _quick_check_impl
+humanqa_evaluate = _evaluate_impl
+humanqa_get_report = _get_report_impl
+humanqa_compare = _compare_impl
+
+
+# ---------------------------------------------------------------------------
+# MCP tool registration (only when mcp package is available)
+# ---------------------------------------------------------------------------
+
+def _register_mcp_tools(server: "FastMCP") -> None:
+    """Register all tool functions with the MCP server."""
+
+    @server.tool()
+    async def humanqa_quick_check(
+        url: str,
+        focus: str = "",
+        tier: str = "balanced",
+    ) -> str:
+        """Quick check a URL — fast, single-pass QA evaluation (~30s).
+
+        Returns a lightweight assessment with issues, score, and summary.
+        Use this for rapid feedback during development or PR review.
+
+        Args:
+            url: The product URL to evaluate.
+            focus: Optional focus area (e.g. "checkout flow", "accessibility", "login").
+            tier: Model tier — balanced (default), budget, premium, or openai.
+        """
+        return await _quick_check_impl(url=url, focus=focus, tier=tier)
+
+    @server.tool()
+    async def humanqa_evaluate(
+        url: str,
+        repo_url: str = "",
+        brief: str = "",
+        focus_flows: str = "",
+        tier: str = "balanced",
+        output_dir: str = "./artifacts",
+        fail_on: str = "",
+    ) -> str:
+        """Run a full HumanQA evaluation — multi-agent, multi-lens QA pipeline.
+
+        This is a comprehensive evaluation that takes 2-5 minutes.
+
+        Args:
+            url: The product URL to evaluate.
+            repo_url: Optional GitHub repo URL for deeper product understanding.
+            brief: Optional product description to guide evaluation.
+            focus_flows: Comma-separated focus flows (e.g. "login,checkout,settings").
+            tier: Model tier — balanced (default), budget, premium, or openai.
+            output_dir: Directory for report output (default: ./artifacts).
+            fail_on: CI gate threshold (critical, high, medium, low).
+        """
+        return await _evaluate_impl(
+            url=url, repo_url=repo_url, brief=brief, focus_flows=focus_flows,
+            tier=tier, output_dir=output_dir, fail_on=fail_on,
+        )
+
+    @server.tool()
+    async def humanqa_get_report(
+        run_dir: str = "./artifacts",
+        format: str = "markdown",
+    ) -> str:
+        """Retrieve a previously generated HumanQA report.
+
+        Args:
+            run_dir: Path to the run artifacts directory (default: ./artifacts).
+            format: Report format — markdown, json, html, or handoff.
+        """
+        return await _get_report_impl(run_dir=run_dir, format=format)
+
+    @server.tool()
+    async def humanqa_compare(
+        baseline_dir: str,
+        current_dir: str,
+    ) -> str:
+        """Compare two HumanQA runs to detect regressions and progress.
+
+        Args:
+            baseline_dir: Path to the baseline run artifacts directory.
+            current_dir: Path to the current run artifacts directory.
+        """
+        return await _compare_impl(baseline_dir=baseline_dir, current_dir=current_dir)
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
 def main():
     """Run the HumanQA MCP server."""
-    mcp.run()
+    if not _HAS_MCP:
+        print(
+            "MCP server requires the 'mcp' package. Install with:\n"
+            "  pip install mcp",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    server = FastMCP(
+        "HumanQA",
+        description="External-experience AI QA system — evaluates products like real users would",
+    )
+    _register_mcp_tools(server)
+    server.run()
 
 
 if __name__ == "__main__":
